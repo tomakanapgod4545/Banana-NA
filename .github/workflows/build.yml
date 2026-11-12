@@ -1,0 +1,705 @@
+name: Build IPA (Node.js built-in)
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p Sources nodeapp
+          cat > project.yml << 'EOF_F0'
+          name: TikReader
+          options:
+            bundleIdPrefix: com.example
+            deploymentTarget:
+              iOS: "15.0"
+          targets:
+            TikReader:
+              type: application
+              platform: iOS
+              sources:
+                - path: Sources
+                - path: nodeapp
+                  type: folder
+              dependencies:
+                - framework: NodeMobile.xcframework
+                  embed: true
+              info:
+                path: Info.plist
+                properties:
+                  CFBundleDisplayName: コメント読み上げ
+                  UIBackgroundModes:
+                    - audio
+                  UILaunchScreen: {}
+                  NSAppTransportSecurity:
+                    NSAllowsArbitraryLoads: true
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.tikreader
+                  SWIFT_VERSION: "5.0"
+                  SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging-Header.h
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  ENABLE_BITCODE: NO
+          EOF_F0
+          cat > Sources/App.swift << 'EOF_F1'
+          import SwiftUI
+          import AVFoundation
+          import UIKit
+
+          @main
+          struct TikReaderApp: App {
+              @StateObject private var reader = Reader()
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView().environmentObject(reader)
+                  }
+              }
+          }
+
+          // MARK: - 読み上げ本体(サーバーからコメントを受け取って読む)
+          final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, URLSessionDataDelegate {
+              @Published var status = "停止中"
+              @Published var running = false
+              @Published var log: [String] = []
+
+              private let ud = UserDefaults.standard
+              private let synth = AVSpeechSynthesizer()
+              private var queue: [(text: String, voiceId: String)] = []
+              private var speaking = false
+
+              private var session: URLSession?
+              private var buf = Data()
+              private var base = ""
+              private var user = ""
+              private var retryWork: DispatchWorkItem?
+
+              // 無音を流し続けて、バックグラウンドでも止まりにくくする
+              private let engine = AVAudioEngine()
+              private let silence = AVAudioPlayerNode()
+              private var silenceBuffer: AVAudioPCMBuffer?
+              private var engineReady = false
+
+              override init() {
+                  super.init()
+                  // アプリの中のサーバー(Node.js)を起動する
+                  NodeRunner.start(withMain: Bundle.main.bundlePath + "/nodeapp/main.js")
+                  synth.delegate = self
+                  ud.register(defaults: [
+                      "rate": 0.52, "pitch": 1.0, "maxQ": 5, "maxLen": 60,
+                      "skipUrl": true, "keepAwake": false,
+                      "giftT": "{name}さん、{gift}を{count}個ありがとう!",
+                      "chatT": "{name}さん、{comment}",
+                      "ng": "", "user": "", "server": "",
+                      "voiceChat": "", "voiceGift": "", "allLang": false, "eulerKey": ""
+                  ])
+                  NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)),
+                                                         name: AVAudioSession.interruptionNotification, object: nil)
+              }
+
+              // MARK: 開始 / 停止
+              func start() {
+                  let u = (ud.string(forKey: "user") ?? "")
+                      .replacingOccurrences(of: "@", with: "")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+                  var b = (ud.string(forKey: "server") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                  if u.isEmpty { status = "ユーザー名を入力してください"; return }
+                  if b.isEmpty { b = "http://127.0.0.1:38417" } // 空欄なら内蔵サーバー
+                  if !b.hasPrefix("http") { b = "https://" + b }
+                  while b.hasSuffix("/") { b.removeLast() }
+                  user = u; base = b
+                  running = true
+                  status = "接続中…"
+                  startAudio()
+                  UIApplication.shared.isIdleTimerDisabled = ud.bool(forKey: "keepAwake")
+                  speak("読み上げを開始します", priority: true)
+                  connect()
+              }
+
+              func stop(message: String? = nil) {
+                  running = false
+                  retryWork?.cancel()
+                  session?.invalidateAndCancel()
+                  session = nil
+                  queue.removeAll()
+                  speaking = false
+                  synth.stopSpeaking(at: .immediate)
+                  silence.stop()
+                  engine.stop()
+                  try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                  UIApplication.shared.isIdleTimerDisabled = false
+                  status = message ?? "停止中"
+              }
+
+              // MARK: 音声セッション
+              private func startAudio() {
+                  let s = AVAudioSession.sharedInstance()
+                  try? s.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers])
+                  try? s.setActive(true)
+                  if !engineReady {
+                      let fmt = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+                      let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 44100)!
+                      buffer.frameLength = 44100
+                      if let p = buffer.floatChannelData?[0] {
+                          for i in 0..<Int(buffer.frameLength) { p[i] = 0 }
+                      }
+                      silenceBuffer = buffer
+                      engine.attach(silence)
+                      engine.connect(silence, to: engine.mainMixerNode, format: fmt)
+                      engineReady = true
+                  }
+                  if !engine.isRunning { try? engine.start() }
+                  if let b = silenceBuffer {
+                      silence.stop()
+                      silence.scheduleBuffer(b, at: nil, options: .loops, completionHandler: nil)
+                      silence.play()
+                  }
+              }
+
+              @objc private func interrupted(_ n: Notification) {
+                  DispatchQueue.main.async {
+                      guard self.running,
+                            let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                            AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+                      self.startAudio()
+                  }
+              }
+
+              // MARK: サーバー接続(SSE)
+              private func connect() {
+                  guard running else { return }
+                  guard var comps = URLComponents(string: base + "/events") else {
+                      stop(message: "サーバーのURLが正しくありません"); return
+                  }
+                  var items = [URLQueryItem(name: "user", value: user)]
+                  let key = (ud.string(forKey: "eulerKey") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                  if !key.isEmpty { items.append(URLQueryItem(name: "key", value: key)) }
+                  comps.queryItems = items
+                  guard let url = comps.url else { stop(message: "サーバーのURLが正しくありません"); return }
+
+                  var req = URLRequest(url: url)
+                  req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                  req.timeoutInterval = 86400
+                  let cfg = URLSessionConfiguration.default
+                  cfg.timeoutIntervalForRequest = 86400
+                  cfg.timeoutIntervalForResource = 86400
+                  cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+
+                  buf = Data()
+                  let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+                  session = s
+                  s.dataTask(with: req).resume()
+              }
+
+              func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                              didReceive response: URLResponse,
+                              completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+                  if let h = response as? HTTPURLResponse, h.statusCode != 200 {
+                      DispatchQueue.main.async { self.stop(message: "サーバーに接続できません(\(h.statusCode))") }
+                      completionHandler(.cancel)
+                      return
+                  }
+                  completionHandler(.allow)
+              }
+
+              func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                  DispatchQueue.main.async {
+                      guard session === self.session else { return }
+                      self.buf.append(data)
+                      self.drain()
+                  }
+              }
+
+              func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                  DispatchQueue.main.async {
+                      guard self.running, session === self.session else { return }
+                      self.status = "再接続中…"
+                      let w = DispatchWorkItem { [weak self] in
+                          guard let self = self, self.running else { return }
+                          self.connect()
+                      }
+                      self.retryWork = w
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: w)
+                  }
+              }
+
+              private func drain() {
+                  let sep = Data("\n\n".utf8)
+                  while let r = buf.range(of: sep) {
+                      let block = buf.subdata(in: buf.startIndex..<r.lowerBound)
+                      buf.removeSubrange(buf.startIndex..<r.upperBound)
+                      handle(String(decoding: block, as: UTF8.self))
+                  }
+              }
+
+              private func handle(_ block: String) {
+                  var event = "message"
+                  var dataStr = ""
+                  for line in block.split(separator: "\n", omittingEmptySubsequences: true) {
+                      if line.hasPrefix("event:") {
+                          event = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                      } else if line.hasPrefix("data:") {
+                          dataStr += line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                      }
+                  }
+                  guard !dataStr.isEmpty,
+                        let obj = (try? JSONSerialization.jsonObject(with: Data(dataStr.utf8))) as? [String: Any]
+                  else { return }
+
+                  switch event {
+                  case "status":
+                      let state = obj["state"] as? String ?? ""
+                      let msg = obj["message"] as? String ?? ""
+                      if state == "connected" {
+                          status = "接続OK。コメントを待っています"
+                      } else if state == "error" {
+                          stop(message: "接続できません: \(msg)(配信中か確認してください)")
+                      } else if state == "ended" {
+                          stop(message: "配信が終了しました")
+                      } else if state == "warn" {
+                          addLog("⚠ " + msg)
+                      } else if state == "disconnected" {
+                          status = "TikTokとの接続が切れました。再接続します"
+                          session?.invalidateAndCancel() // 完了処理から自動で再接続
+                      }
+                  case "debug":
+                      // TikTokから何が届いているかの確認用
+                      let counts = obj["counts"] as? [String: Any] ?? [:]
+                      let summary = counts.map { "\($0.key) \($0.value)" }.sorted().joined(separator: ", ")
+                      if running { status = "接続OK。受信: " + (summary.isEmpty ? "まだなし" : summary) }
+                  case "chat":
+                      let name = obj["name"] as? String ?? ""
+                      let comment = clean(obj["comment"] as? String ?? "")
+                      if comment.isEmpty { addLog("(空のコメントを受信)"); return }
+                      if isNG(comment) { addLog("[NG] \(name): \(comment)"); return }
+                      addLog("\(name): \(comment)")
+                      speak(fill(ud.string(forKey: "chatT") ?? "{comment}", name: name, comment: comment), voiceKey: "voiceChat")
+                  case "gift":
+                      let name = obj["name"] as? String ?? ""
+                      let gift = obj["gift"] as? String ?? "ギフト"
+                      let count = obj["count"] as? Int ?? 1
+                      addLog("🎁 \(name) → \(gift) ×\(count)")
+                      speak(fill(ud.string(forKey: "giftT") ?? "", name: name, gift: gift, count: count), priority: true, voiceKey: "voiceGift")
+                  default:
+                      break
+                  }
+              }
+
+              // MARK: テキスト処理
+              private func fill(_ t: String, name: String = "", comment: String = "", gift: String = "", count: Int = 0) -> String {
+                  t.replacingOccurrences(of: "{name}", with: name)
+                   .replacingOccurrences(of: "{comment}", with: comment)
+                   .replacingOccurrences(of: "{gift}", with: gift)
+                   .replacingOccurrences(of: "{count}", with: count > 0 ? String(count) : "")
+              }
+
+              private func clean(_ text: String) -> String {
+                  var t = text
+                  if ud.bool(forKey: "skipUrl") {
+                      t = t.replacingOccurrences(of: "https?://\\S+", with: "", options: .regularExpression)
+                  }
+                  t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let maxLen = max(1, ud.integer(forKey: "maxLen"))
+                  if t.count > maxLen { t = String(t.prefix(maxLen)) + "、以下省略" }
+                  return t
+              }
+
+              private func isNG(_ text: String) -> Bool {
+                  let words = (ud.string(forKey: "ng") ?? "")
+                      .components(separatedBy: CharacterSet(charactersIn: ",、\n"))
+                      .map { $0.trimmingCharacters(in: .whitespaces) }
+                      .filter { !$0.isEmpty }
+                  return words.contains { text.contains($0) }
+              }
+
+              private func addLog(_ s: String) {
+                  log.insert(s, at: 0)
+                  if log.count > 50 { log.removeLast() }
+              }
+
+              // MARK: 読み上げ(順番待ち)
+              func speak(_ text: String, priority: Bool = false, voiceKey: String = "voiceChat") {
+                  if text.isEmpty { return }
+                  let vid = ud.string(forKey: voiceKey) ?? ""
+                  if priority { queue.insert((text, vid), at: 0) } else { queue.append((text, vid)) }
+                  let mx = max(1, ud.integer(forKey: "maxQ"))
+                  while queue.count > mx { queue.removeFirst() } // 溜まりすぎたら古いものを飛ばす
+                  next()
+              }
+
+              private func prepareSessionForTest() {
+                  if !running {
+                      let s = AVAudioSession.sharedInstance()
+                      try? s.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers])
+                      try? s.setActive(true)
+                  }
+              }
+
+              func testGift() {
+                  prepareSessionForTest()
+                  let t = fill(ud.string(forKey: "giftT") ?? "", name: "テスト", gift: "バラ", count: 3)
+                  speak(t, priority: true, voiceKey: "voiceGift")
+              }
+
+              func testChat() {
+                  prepareSessionForTest()
+                  let t = fill(ud.string(forKey: "chatT") ?? "{comment}", name: "テスト", comment: "こんにちは、はじめまして")
+                  speak(t, priority: true, voiceKey: "voiceChat")
+              }
+
+              private func next() {
+                  guard !speaking, !queue.isEmpty else { return }
+                  let item = queue.removeFirst()
+                  let u = AVSpeechUtterance(string: item.text)
+                  var voice: AVSpeechSynthesisVoice? = nil
+                  if !item.voiceId.isEmpty { voice = AVSpeechSynthesisVoice(identifier: item.voiceId) }
+                  u.voice = voice ?? AVSpeechSynthesisVoice(language: "ja-JP")
+                  u.rate = Float(ud.double(forKey: "rate"))
+                  u.pitchMultiplier = Float(ud.double(forKey: "pitch"))
+                  u.volume = 1.0
+                  speaking = true
+                  synth.speak(u)
+              }
+
+              func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+                  DispatchQueue.main.async { self.speaking = false; self.next() }
+              }
+              func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+                  DispatchQueue.main.async { self.speaking = false; self.next() }
+              }
+          }
+
+          // MARK: - 画面
+          struct ContentView: View {
+              @EnvironmentObject var reader: Reader
+
+              @AppStorage("user") private var user = ""
+              @AppStorage("server") private var server = ""
+              @AppStorage("rate") private var rate = 0.52
+              @AppStorage("pitch") private var pitch = 1.0
+              @AppStorage("giftT") private var giftT = "{name}さん、{gift}を{count}個ありがとう!"
+              @AppStorage("chatT") private var chatT = "{name}さん、{comment}"
+              @AppStorage("ng") private var ng = ""
+              @AppStorage("maxLen") private var maxLen = 60
+              @AppStorage("maxQ") private var maxQ = 5
+              @AppStorage("skipUrl") private var skipUrl = true
+              @AppStorage("keepAwake") private var keepAwake = false
+              @AppStorage("voiceChat") private var voiceChat = ""
+              @AppStorage("voiceGift") private var voiceGift = ""
+              @AppStorage("allLang") private var allLang = false
+              @AppStorage("eulerKey") private var eulerKey = ""
+
+              private var voiceList: [AVSpeechSynthesisVoice] {
+                  AVSpeechSynthesisVoice.speechVoices()
+                      .filter { allLang || $0.language.hasPrefix("ja") }
+                      .sorted { a, b in
+                          if a.quality.rawValue != b.quality.rawValue { return a.quality.rawValue > b.quality.rawValue }
+                          return a.name < b.name
+                      }
+              }
+
+              private func voiceLabel(_ v: AVSpeechSynthesisVoice) -> String {
+                  var s = v.name
+                  if allLang { s += " (" + v.language + ")" }
+                  if v.quality.rawValue >= 3 { s += " ★最高品質" }
+                  else if v.quality.rawValue == 2 { s += " ☆高品質" }
+                  return s
+              }
+
+              var body: some View {
+                  NavigationView {
+                      Form {
+                          Section(header: Text("接続")) {
+                              TextField("TikTokのユーザー名(@なし)", text: $user)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              TextField("Euler APIキー(必要な時だけ)", text: $eulerKey)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              TextField("サーバーのURL(空欄で内蔵サーバー)", text: $server)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                                  .keyboardType(.URL)
+                          }
+
+                          Section(header: Text("読み上げ")) {
+                              VStack(alignment: .leading) {
+                                  Text("速度 ×" + String(format: "%.1f", rate / 0.5))
+                                  Slider(value: $rate, in: 0.35...0.75)
+                              }
+                              VStack(alignment: .leading) {
+                                  Text("声の高さ " + String(format: "%.1f", pitch))
+                                  Slider(value: $pitch, in: 0.5...2.0)
+                              }
+                          }
+
+                          Section(header: Text("声の種類"),
+                                  footer: Text("声を増やすには、iPhoneの「設定 → アクセシビリティ → 読み上げコンテンツ → 声 → 日本語」で、声をダウンロードします。「高品質」の声ほど自然です。")) {
+                              Picker("コメントの声", selection: $voiceChat) {
+                                  Text("標準").tag("")
+                                  ForEach(voiceList, id: \.identifier) { v in
+                                      Text(voiceLabel(v)).tag(v.identifier)
+                                  }
+                              }
+                              Picker("ギフトの声", selection: $voiceGift) {
+                                  Text("標準").tag("")
+                                  ForEach(voiceList, id: \.identifier) { v in
+                                      Text(voiceLabel(v)).tag(v.identifier)
+                                  }
+                              }
+                              Toggle("日本語以外の声も表示", isOn: $allLang)
+                          }
+
+                          Section(header: Text("読み上げる文"),
+                                  footer: Text("{name}=送った人 {gift}=ギフト名 {count}=個数 {comment}=コメント")) {
+                              TextField("ギフトが来た時", text: $giftT)
+                              TextField("コメントの形式", text: $chatT)
+                          }
+
+                          Section {
+                              Button(reader.running ? "停止" : "読み上げ開始") {
+                                  if reader.running { reader.stop() } else { reader.start() }
+                              }
+                              .font(.headline)
+                              .foregroundColor(reader.running ? .red : .accentColor)
+                              Button("コメントの声のテスト") { reader.testChat() }
+                              Button("ギフトの声のテスト") { reader.testGift() }
+                              Text(reader.status).foregroundColor(.secondary)
+                          }
+
+                          Section(header: Text("詳細設定")) {
+                              TextField("NGワード(カンマ区切り)", text: $ng)
+                              Stepper("最大文字数 \(maxLen)", value: $maxLen, in: 10...200, step: 10)
+                              Stepper("読み上げ待ちの上限 \(maxQ)", value: $maxQ, in: 1...20)
+                              Toggle("URLは読まない", isOn: $skipUrl)
+                              Toggle("画面を消さない", isOn: $keepAwake)
+                          }
+
+                          Section(header: Text("コメント履歴")) {
+                              ForEach(reader.log, id: \.self) { Text($0).font(.footnote) }
+                          }
+                      }
+                      .navigationTitle("コメント読み上げ")
+                  }
+                  .navigationViewStyle(.stack)
+              }
+          }
+          EOF_F1
+          cat > Sources/NodeRunner.h << 'EOF_F2'
+          #import <Foundation/Foundation.h>
+
+          @interface NodeRunner : NSObject
+          + (void)startWithMain:(NSString *)mainPath;
+          @end
+          EOF_F2
+          cat > Sources/NodeRunner.m << 'EOF_F3'
+          #import "NodeRunner.h"
+          #include <stdlib.h>
+          #include <string.h>
+
+          // NodeMobile.framework が持っている、Node.jsを起動する関数
+          extern int node_start(int argc, char *argv[]);
+
+          @implementation NodeRunner
+
+          static BOOL started = NO;
+
+          + (void)startWithMain:(NSString *)mainPath {
+              if (started) return;
+              started = YES;
+
+              // Node.jsが書き込みに使う場所を用意する
+              NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+              setenv("HOME", docs.UTF8String, 1);
+              setenv("TMPDIR", NSTemporaryDirectory().UTF8String, 1);
+              setenv("TIK_PORT", "38417", 1);
+
+              NSThread *thread = [[NSThread alloc] initWithBlock:^{
+                  NSArray<NSString *> *args = @[@"node", mainPath];
+                  int argc = (int)args.count;
+
+                  // Node.jsは、引数が1かたまりのメモリに並んでいることを期待する
+                  size_t total = 0;
+                  for (NSString *a in args) total += strlen(a.UTF8String) + 1;
+                  char *buf = calloc(total, 1);
+                  char **argv = calloc(argc + 1, sizeof(char *));
+                  char *p = buf;
+                  for (int i = 0; i < argc; i++) {
+                      const char *s = args[i].UTF8String;
+                      size_t n = strlen(s) + 1;
+                      memcpy(p, s, n);
+                      argv[i] = p;
+                      p += n;
+                  }
+                  node_start(argc, argv);
+              }];
+              thread.stackSize = 4 * 1024 * 1024;
+              thread.name = @"node";
+              [thread start];
+          }
+
+          @end
+          EOF_F3
+          cat > Sources/Bridging-Header.h << 'EOF_F4'
+          #import "NodeRunner.h"
+          EOF_F4
+          cat > nodeapp/main.js << 'EOF_F5'
+          // アプリの中で動く、TikTok LIVEのコメント中継サーバー
+          const http = require('http');
+          const lib = require('tiktok-live-connector');
+          const Conn = lib.TikTokLiveConnection || lib.WebcastPushConnection;
+
+          process.on('uncaughtException', (e) => console.error('uncaught', e));
+          process.on('unhandledRejection', (e) => console.error('unhandled', e));
+
+          function errText(e) {
+            if (!e) return '不明なエラー';
+            if (typeof e === 'string') return e;
+            const parts = [];
+            if (e.name) parts.push(e.name);
+            if (e.message) parts.push(typeof e.message === 'string' ? e.message : JSON.stringify(e.message));
+            if (e.exception && e.exception.message) parts.push(e.exception.message);
+            if (e.info) parts.push(typeof e.info === 'string' ? e.info : JSON.stringify(e.info));
+            if (parts.length) return parts.join(' / ');
+            try { return JSON.stringify(e, Object.getOwnPropertyNames(e)); } catch (_) { return String(e); }
+          }
+
+          // 受け取ったデータの形がバージョンで違っても名前を取れるようにする
+          const uname = (d) => (d.user && (d.user.nickname || d.user.uniqueId)) || d.nickname || d.uniqueId || '';
+
+          const PORT = parseInt(process.env.TIK_PORT || '38417', 10);
+
+          const server = http.createServer((req, res) => {
+            const u = new URL(req.url, 'http://127.0.0.1');
+            if (u.pathname === '/health') { res.end('ok'); return; }
+            if (u.pathname !== '/events') { res.statusCode = 404; res.end('not found'); return; }
+
+            const user = String(u.searchParams.get('user') || '').replace(/^@/, '').trim();
+            if (!/^[A-Za-z0-9._]{1,40}$/.test(user)) { res.statusCode = 400; res.end('invalid user'); return; }
+
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+            });
+            const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            res.write(': ready\n\n');
+
+            let ready = false; // 接続直後の過去コメントは読まない
+            let conn;
+            try {
+              const opts = { processInitialData: false, enableExtendedGiftInfo: true };
+              const key = (u.searchParams.get('key') || '').trim();
+              if (key) opts.signApiKey = key; // Euler StreamのAPIキー(任意)
+              conn = new Conn(user, opts);
+            } catch (e) {
+              send('status', { state: 'error', message: errText(e) });
+              return;
+            }
+
+            conn.connect()
+              .then(() => { send('status', { state: 'connected' }); setTimeout(() => { ready = true; }, 2500); })
+              .catch((e) => { console.error(e); send('status', { state: 'error', message: errText(e) }); });
+
+            // 何が届いているかを数えて、アプリに知らせる(原因調べ用)
+            const counts = {};
+            let dirty = true;
+            const count = (k) => { counts[k] = (counts[k] || 0) + 1; dirty = true; };
+            ['member', 'like', 'roomUser', 'social', 'follow', 'share', 'emote', 'envelope', 'subscribe']
+              .forEach((k) => conn.on(k, () => count(k)));
+            conn.on('decodedData', (ev) => {
+              const k = String(ev).replace(/^Webcast/, '').replace(/Message$/, '');
+              count('raw:' + k);
+            });
+            conn.on('error', (e) => {
+              console.error('conn error', e);
+              send('status', { state: 'warn', message: errText(e) });
+            });
+
+            conn.on('chat', (d) => {
+              count('chat');
+              const comment = d.comment || d.content || '';
+              console.log('chat:', uname(d), comment, ready ? '' : '(過去分・無視)');
+              if (!ready) return;
+              send('chat', { name: uname(d), comment });
+            });
+
+            conn.on('gift', (d) => {
+              count('gift');
+              if (!ready) return;
+              // 連続ギフトは途中経過を無視して、終わった時だけ読む
+              const gt = d.giftType !== undefined ? d.giftType : (d.giftDetails && d.giftDetails.giftType);
+              if (gt === 1 && !d.repeatEnd) return;
+              const gift = d.giftName || (d.giftDetails && d.giftDetails.giftName) || (d.gift && d.gift.name) || 'ギフト';
+              send('gift', { name: uname(d), gift, count: d.repeatCount || 1 });
+            });
+
+            conn.on('streamEnd', () => send('status', { state: 'ended' }));
+            conn.on('disconnected', () => send('status', { state: 'disconnected' }));
+
+            const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+            const dbg = setInterval(() => {
+              if (dirty) { dirty = false; send('debug', { counts }); }
+            }, 3000);
+            res.on('close', () => {
+              clearInterval(ping);
+              clearInterval(dbg);
+              try { conn.disconnect(); } catch (e) {}
+            });
+          });
+
+          server.listen(PORT, '127.0.0.1', () => console.log('listening on ' + PORT));
+          EOF_F5
+          cat > nodeapp/package.json << 'EOF_F6'
+          {
+            "name": "tikserver",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "tiktok-live-connector": "latest"
+            }
+          }
+          EOF_F6
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Download NodeMobile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release list --repo digidem/nodejs-mobile --limit 1 --json tagName -q '.[0].tagName')
+          echo "release: $TAG"
+          gh release download "$TAG" --repo digidem/nodejs-mobile --pattern 'nodejs-mobile-ios-[0-9]*.zip' --dir nm
+          cd nm && unzip -q ./*.zip && cd ..
+          FW=$(find nm -maxdepth 4 -name NodeMobile.xcframework | head -n 1)
+          echo "found: $FW"
+          cp -R "$FW" ./NodeMobile.xcframework
+          ls NodeMobile.xcframework
+      - name: Install JS packages
+        run: |
+          cd nodeapp
+          npm install --omit=dev --omit=optional --no-audit --no-fund
+          echo "native files (should be empty):"
+          find node_modules -name "*.node" | head
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project TikReader.xcodeproj -scheme TikReader \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package ipa
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/TikReader.app Payload/
+          zip -qr TikReader.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TikReader-ipa
+          path: TikReader.ipa
